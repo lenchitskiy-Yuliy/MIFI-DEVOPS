@@ -1,0 +1,68 @@
+name: Calculator CI/CD
+
+on:
+  push:                # Запуск при каждом пуше в любую ветку
+  pull_request:        # Запуск при создании и обновлении Pull Request
+    branches: [ "master" ]
+  workflow_dispatch:   # Ручной запуск из вкладки Actions
+
+jobs:
+  build-and-test:
+    name: Build, Test & Save Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 with Maven Cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven' # Кэширует ~/.m2/repository, ключ зависит от хэша pom.xml
+
+      - name: Build and Run Unit Tests
+        run: mvn -B clean package
+
+      - name: Upload Test Reports
+        if: always() # Сохраняем отчёты, даже если тесты упали
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+          retention-days: 5
+
+      - name: Upload Executable JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: calculator-jar
+          path: target/*.jar
+          retention-days: 7
+
+  smoke-test:
+    name: Run Saved Artifact
+    needs: build-and-test # Запуск только после успешной сборки
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Download Built JAR Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: calculator-jar
+          path: target/
+
+      - name: Verify Downloaded Artifact
+        run: ls -la target/
+
+      - name: Run Calculator from JAR
+        run: |
+          RESULT=$(echo "2 + 3 * 4 S" | java -jar target/calculator-1.0.0.jar | tail -n 1)
+          echo "Result: $RESULT"
+          test "$RESULT" = "20.0"
