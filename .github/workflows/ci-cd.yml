@@ -1,68 +1,151 @@
 name: Calculator CI/CD
 
 on:
-  push:                # Запуск при каждом пуше в любую ветку
-  pull_request:        # Запуск при создании и обновлении Pull Request
-    branches: [ "master" ]
-  workflow_dispatch:   # Ручной запуск из вкладки Actions
+  push:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build-and-test:
-    name: Build, Test & Save Artifact
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and export image
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --tag "$IMAGE" .
+          docker save --output calculator-image.tar "$IMAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calculator-image
+          path: calculator-image.tar
+          if-no-files-found: error
+          compression-level: 1
+          overwrite: true
+          retention-days: 7
+
+      - name: Extract executable JAR
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: |
+          container=$(docker create "$IMAGE")
+          trap 'docker rm "$container"' EXIT
+          docker cp "$container:/app/app.jar" calculator-1.0.0.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calculator-jar
+          path: calculator-1.0.0.jar
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  test:
+    name: Run unit and container tests
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 17 with Maven Cache
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: 'temurin'
-          cache: 'maven' # Кэширует ~/.m2/repository, ключ зависит от хэша pom.xml
+          distribution: temurin
+          cache: maven
 
-      - name: Build and Run Unit Tests
-        run: mvn -B clean package
+      - name: Run unit tests
+        run: mvn -B test
 
-      - name: Upload Test Reports
-        if: always() # Сохраняем отчёты, даже если тесты упали
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: test-reports
           path: target/surefire-reports/
+          overwrite: true
           retention-days: 5
 
-      - name: Upload Executable JAR
-        uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: calculator-jar
-          path: target/*.jar
-          retention-days: 7
+          name: calculator-image
 
-  smoke-test:
-    name: Run Saved Artifact
-    needs: build-and-test # Запуск только после успешной сборки
+      - name: Run calculator from built image
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          docker load --input calculator-image.tar
+          result=$(printf '%s\n' '2 + 3 * 4 S' | docker run --rm -i "$IMAGE")
+          printf '%s\n' "$result"
+          test "$result" = $'5.0\n20.0'
+
+  publish:
+    name: Push tested image to GHCR
+    needs: [build, test]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/download-artifact@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          name: calculator-image
 
-      - name: Download Built JAR Artifact
-        uses: actions/download-artifact@v4
+      - uses: docker/login-action@v3
         with:
-          name: calculator-jar
-          path: target/
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify Downloaded Artifact
-        run: ls -la target/
-
-      - name: Run Calculator from JAR
+      - name: Push image
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
         run: |
-          RESULT=$(echo "2 + 3 * 4 S" | java -jar target/calculator-1.0.0.jar | tail -n 1)
-          echo "Result: $RESULT"
-          test "$RESULT" = "20.0"
+          docker load --input calculator-image.tar
+          docker push "$IMAGE"
+
+  verify-published:
+    name: Pull and run image from GHCR
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check published image
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          docker pull "$IMAGE"
+          result=$(printf '%s\n' '2 + 3 * 4 S' | docker run --rm -i "$IMAGE")
+          printf '%s\n' "$result"
+          test "$result" = $'5.0\n20.0'
